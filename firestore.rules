@@ -1,0 +1,153 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(uid) {
+      return signedIn() && request.auth.uid == uid;
+    }
+
+    // Secure Admin authorization:
+    // 1. Firebase Auth custom claim token.role == 'ADMIN' or token.admin == true
+    // 2. OR matching authorized admin document in /adminConfig/authorization
+    function isAdmin() {
+      return signedIn() && (
+        request.auth.token.role == 'ADMIN' ||
+        request.auth.token.admin == true ||
+        (exists(/databases/$(database)/documents/adminConfig/authorization) &&
+         request.auth.uid in get(/databases/$(database)/documents/adminConfig/authorization).data.adminUids)
+      );
+    }
+
+    function isAssignedCoach(athleteUid) {
+      return signedIn() && (
+        request.auth.token.role == 'COACH' ||
+        (exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'COACH') ||
+        (exists(/databases/$(database)/documents/coachAssignments/$(request.auth.uid + '_' + athleteUid)) &&
+         get(/databases/$(database)/documents/coachAssignments/$(request.auth.uid + '_' + athleteUid)).data.status == 'ACTIVE')
+      );
+    }
+
+    // Privilege escalation prevention: Regular users cannot make themselves ADMIN
+    function notEscalatingToAdmin() {
+      return !('role' in request.resource.data) ||
+             request.resource.data.role != 'ADMIN' ||
+             isAdmin();
+    }
+
+    // /adminConfig - strictly readable by signedIn, writable only by admin
+    match /adminConfig/{configId} {
+      allow read: if signedIn();
+      allow write: if isAdmin();
+    }
+
+    // User profile documents:
+    // Athletes can read & update their own profile (cannot escalate to ADMIN)
+    // Assigned coaches can read athlete progress
+    // Admin can read and write all users
+    match /users/{uid} {
+      allow read: if isOwner(uid) || isAdmin() || isAssignedCoach(uid) || signedIn();
+      allow create: if isOwner(uid) && notEscalatingToAdmin();
+      allow update: if (isOwner(uid) && notEscalatingToAdmin()) || isAdmin();
+      allow delete: if isAdmin();
+    }
+
+    // 1-on-1 Athlete-Coach Conversations:
+    // Private! Only participants or admins can access
+    match /conversations/{convId} {
+      allow read: if signedIn() && (
+        request.auth.uid in resource.data.participants ||
+        isAdmin()
+      );
+      allow create: if signedIn() && (
+        request.auth.uid in request.resource.data.participants
+      );
+      allow update: if signedIn() && (
+        request.auth.uid in resource.data.participants ||
+        isAdmin()
+      );
+      allow delete: if isAdmin();
+
+      // Messages sub-collection
+      match /messages/{msgId} {
+        allow read: if signedIn() && (
+          request.auth.uid in get(/databases/$(database)/documents/conversations/$(convId)).data.participants ||
+          isAdmin()
+        );
+        allow create: if signedIn() && (
+          request.auth.uid == request.resource.data.senderId &&
+          request.auth.uid in get(/databases/$(database)/documents/conversations/$(convId)).data.participants
+        );
+        allow update: if signedIn() && (
+          request.auth.uid == resource.data.senderId ||
+          isAdmin()
+        );
+        allow delete: if isAdmin();
+      }
+    }
+
+    // Formal Coach-Athlete assignment directory
+    match /coachAssignments/{assignmentId} {
+      allow read: if signedIn();
+      allow write: if isAdmin() || (
+        signedIn() && (
+          request.auth.uid == request.resource.data.coachId ||
+          request.auth.uid == resource.data.coachId
+        )
+      );
+    }
+
+    // Public / Group Leaderboard
+    match /leaderboard/{entryId} {
+      allow read: if signedIn();
+      allow write: if isOwner(entryId) || isAdmin();
+    }
+
+    // Anti-Doping Daily/Weekly Challenges
+    match /challenges/{challengeId} {
+      allow read: if signedIn();
+      allow write: if isAdmin();
+    }
+
+    // Learning Curriculum Modules & Lessons
+    match /curriculumModules/{moduleId} {
+      allow read: if signedIn();
+      allow write: if isAdmin();
+    }
+
+    // Question Bank / Quizzes
+    match /quizQuestions/{questionId} {
+      allow read: if signedIn();
+      allow write: if isAdmin();
+    }
+
+    // Medicine & Active Ingredient Reference
+    match /medicineEntries/{entryId} {
+      allow read: if signedIn();
+      allow write: if isAdmin();
+    }
+
+    // Immutable Audit Logs for Regulatory & Compliance
+    // Readable only by Admin, writable by signedIn or admin, immutable
+    match /auditLogs/{logId} {
+      allow read: if isAdmin();
+      allow create: if signedIn();
+      allow update, delete: if false;
+    }
+
+    // System Settings
+    match /systemSettings/{settingId} {
+      allow read: if signedIn();
+      allow write: if isAdmin();
+    }
+
+    // Default deny for unknown collections
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
